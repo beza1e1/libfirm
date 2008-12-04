@@ -32,6 +32,503 @@
 
 #include "iroptimize.h"
 
+#if 1
+
+#include <assert.h>
+
+#include "debug.h"
+#include "irprintf.h"
+
+#include "array.h"
+#include "array_t.h"
+#include "bitset.h"
+#include "ircons.h"
+#include "iredges.h"
+#include "irgmod.h"
+#include "irgraph.h"
+#include "irgwalk.h"
+#include "irnode.h"
+#include "irtools.h"
+
+
+static bitset_t *block_marked;
+
+
+/* Simple recursive algorithm to mark all reachable blocks beginning at the
+ * start block */
+static void mark_reachable(ir_node *const block)
+{
+	int       const  block_idx = get_irn_idx(block);
+	ir_edge_t const *edge;
+
+	if (bitset_is_set(block_marked, block_idx))
+		return;
+	bitset_set(block_marked, block_idx);
+
+	//ir_fprintf(stderr, "%+F is reachable\n", block);
+
+	foreach_block_succ(block, edge) {
+		ir_node *const succ = get_edge_src_irn(edge);
+		mark_reachable(succ);
+	}
+}
+
+
+/* Set unreachable control flow predecessors to Bad */
+static void remove_unreachable_preds(ir_node *const block, void *const env)
+{
+	int arity;
+	int i;
+
+	(void)env;
+
+	/* There's no point in optimising unreachable blocks */
+	if (!bitset_is_set(block_marked, get_irn_idx(block)))
+		return;
+
+	arity = get_Block_n_cfgpreds(block);
+	for (i = 0; i < arity; ++i) {
+		ir_node *const pred = get_Block_cfgpred(block, i);
+
+		if (is_Bad(pred))
+			continue;
+		if (bitset_is_set(block_marked, get_irn_idx(get_nodes_block(pred))))
+			continue;
+
+		//ir_fprintf(stderr, "unreachable %+F removed\n", get_nodes_block(pred));
+
+		set_Block_cfgpred(block, i, new_Bad(mode_X));
+	}
+}
+
+
+/* Daisy chain all Phis to their blocks, replace Conds with only a default Proj
+ * by Jmp and mark all non-empty blocks, i.e. blocks which contain anything
+ * besides Phis and a Jmp */
+static void collect_phis_kill_default_and_mark_nonempty(ir_node *const node, void *const env)
+{
+	(void)env;
+
+	if (is_Phi(node)) {
+		ir_node *const block = get_nodes_block(node);
+		set_irn_link(node, get_irn_link(block));
+		set_irn_link(block, node);
+	} else if (!is_Jmp(node) && !is_Block(node)) {
+		ir_node *const block = get_nodes_block(node);
+
+		/* eliminate switches, which only have a default proj */
+		if (is_Cond(node) && mode_is_int(get_irn_mode(get_Cond_selector(node)))) {
+			ir_node         *proj0 = NULL;
+			ir_edge_t const *edge;
+
+			foreach_out_edge(node, edge) {
+				ir_node *const proj = get_edge_src_irn(edge);
+				assert(is_Proj(proj));
+				if (proj0 != NULL)
+					goto mark_non_empty;
+				proj0 = proj;
+			}
+			assert(proj0 != NULL);
+			assert(get_Cond_default_proj(node) == get_Proj_proj(proj0));
+			exchange(proj0, new_r_Jmp(block));
+		}
+
+mark_non_empty:
+		bitset_set(block_marked, get_irn_idx(block));
+	}
+}
+
+
+/* Retrieve the number of non-Bad CF predecessors of block */
+static int count_preds(ir_node *const block)
+{
+	int const arity = get_Block_n_cfgpreds(block);
+	int       count = 0;
+	int       i;
+
+	for (i = 0; i < arity; ++i) {
+		count += !is_Bad(get_Block_cfgpred(block, i));
+	}
+	return count;
+}
+
+
+/* Find a fan, i.e. an empty (except for Phi and Jmp) block with multiple
+ * predecesors. Skip single-entry-single-exit block chains */
+/* TODO remove, is overkill, the case does not exist */
+static ir_node *find_fan(ir_node *const jmp)
+{
+	ir_node *const block = get_nodes_block(jmp);
+	int            arity;
+	int            i;
+
+	if (bitset_is_set(block_marked, get_irn_idx(block)))
+		return NULL;
+
+	arity = get_Block_n_cfgpreds(block);
+	for (i = 0; i < arity; ++i) {
+		ir_node *const pred = get_Block_cfgpred(block, i);
+		if (is_Bad(pred)) continue;
+		for (++i; i < arity; ++i) {
+			if (!is_Bad(get_Block_cfgpred(block, i))) return block;
+		}
+		return find_fan(pred);
+	}
+	return NULL;
+}
+
+
+static int merge_block_fan(ir_node *block)
+{
+	int arity = get_Block_n_cfgpreds(block);
+	int new_arity = arity;
+	int i;
+
+	/* TODO hack to circumvent the ugly case */
+	if (count_preds(block) <= 1) return arity;
+
+	for (i = 0; i < arity; ++i) {
+		ir_node *pred         = get_Block_cfgpred(block, i);
+		ir_node *pred_block;
+		int      pred_n_preds;
+
+		if (!is_Jmp(pred)) continue;
+
+		pred_block = find_fan(pred);
+		if (pred_block == NULL) continue;
+
+		/* A predecessor must have at least two predecessors to merge it, otherwise
+		 * critical edges (and even incorrect control flow) would get created */
+		pred_n_preds = count_preds(pred_block);
+		if (pred_n_preds > 1) new_arity += pred_n_preds - 1;
+	}
+
+	assert(new_arity >= arity);
+	if (new_arity > arity) {
+		ir_node  *phi;
+		ir_node **in;
+		int       j;
+
+		NEW_ARR_A(ir_node*, in, new_arity);
+
+		/* Adjust Phis in this block to the new predecessors */
+		for (phi = get_irn_link(block); phi != NULL; phi = get_irn_link(phi)) {
+			int j = 0;
+
+			for (i = 0; i < arity; ++i) {
+				ir_node *pred       = get_Block_cfgpred(block, i);
+				ir_node *pred_block;
+				ir_node *phi_pred;
+				int      k;
+
+				if (is_Bad(pred)) continue;
+
+				pred_block = find_fan(pred);
+				if (pred_block == NULL) {
+					in[j++] = get_Phi_pred(phi, i);
+					continue;
+				}
+
+				phi_pred = get_Phi_pred(phi, i);
+				if (is_Phi(phi_pred) && get_nodes_block(phi_pred) == pred_block) {
+					/* Copy the predecessors, because it is a phi in the block we are
+					 * merging  */
+					int const pred_arity = get_Block_n_cfgpreds(pred_block);
+					for (k = 0; k < pred_arity;  ++k) {
+						if (is_Bad(get_Block_cfgpred(pred_block, k))) continue;
+						in[j++] = get_Phi_pred(phi_pred, k);
+					}
+				} else {
+					/* Duplicate phi_pred input pred_n_preds times */
+					int const pred_n_preds = count_preds(pred_block);
+					assert(get_nodes_block(phi_pred) != pred_block);
+					for (k = 0; k < pred_n_preds;  ++k) {
+						in[j++] = phi_pred;
+					}
+				}
+			}
+
+			/* It may be less, because we drop Bads */
+			assert(j <= new_arity);
+			set_irn_in(phi, j, in);
+		}
+
+		/* It is possible that a predecessor block dominates this block, so copy
+		 * over the predecessor's Phis */
+		/* TODO phis in predecessor block */
+#if 0
+		j = 0;
+		for (i = 0; i < arity; ++i) {
+			ir_node *pred         = get_Block_cfgpred(block, i);
+			ir_node *pred_block;
+
+			if (is_Bad(pred)) continue;
+
+			pred_block = find_fan(pred);
+			if (pred_block == NULL) {
+				in[j++] = pred;
+				continue;
+			}
+
+			for (phi = get_irn_link(pred_block); phi != NULL;) {
+				ir_node *unknown = new_Unknown(get_irn_mode(phi));
+				ir_node *next_phi;
+
+				/* Kill the Phi in the predecessor block, so it is not kept */
+				next_phi = get_irn_link(phi);
+				exchange(phi, new_Bad(mode_X));
+				phi = next_phi;
+			}
+		}
+#endif
+
+		/* Adjust this block's control flow predecessors */
+		j = 0;
+		for (i = 0; i < arity; ++i) {
+			ir_node *const pred         = get_Block_cfgpred(block, i);
+			ir_node *      pred_block;
+			int            pred_arity;
+			int            k;
+
+			if (is_Bad(pred)) continue;
+
+			pred_block = find_fan(pred);
+			if (pred_block == NULL) {
+				in[j++] = pred;
+				continue;
+			}
+
+			pred_arity = get_Block_n_cfgpreds(pred_block);
+			for (k = 0; k < pred_arity;  ++k) {
+				ir_node *pred_pred = get_Block_cfgpred(pred_block, k);
+
+				if (is_Bad(pred_pred)) continue;
+				in[j++] = pred_pred;
+			}
+		}
+
+		/* It may be less, because we drop Bads */
+		assert(j <= new_arity);
+		set_irn_in(block, j, in);
+		return j;
+	}
+
+	return arity;
+}
+
+
+/* Find the top of a single-entry-single-exit block chain */
+static ir_node *follow_Jmp_chain(ir_node *const jmp)
+{
+	ir_node* block;
+	int      arity;
+	int      i;
+
+	if (!is_Jmp(jmp)) return jmp;
+
+	block = get_nodes_block(jmp);
+	arity = get_Block_n_cfgpreds(block);
+	for (i = 0; i < arity; ++i) {
+		ir_node * const pred = get_Block_cfgpred(block, i);
+		if (is_Bad(pred)) continue;
+		for (++i; i < arity; ++i) {
+			if (!is_Bad(get_Block_cfgpred(block, i))) return NULL;
+		}
+		return follow_Jmp_chain(pred);
+	}
+	return NULL;
+}
+
+
+/* Returns true iff predecessor i and j are equal for every Phi in the chain */
+static int phis_select_same(ir_node *phi, int const i, int const j)
+{
+	for (; phi != NULL; phi = get_irn_link(phi)) {
+		if (get_Phi_pred(phi, i) != get_Phi_pred(phi, j)) {
+			return 0;
+		}
+	}
+	return 1;
+}
+
+
+static void remove_pointless_cond(ir_node *block, void *env)
+{
+#if 0 /* TODO */
+	const int arity = merge_block_fan(block);
+#else
+	const int arity = get_Block_n_cfgpreds(block);
+#endif
+	int       i;
+
+	(void)env;
+
+restart:
+	for (i = 0; i < arity; ++i) {
+		ir_node *pred_i = get_Block_cfgpred(block, i);
+		int j;
+
+		pred_i = follow_Jmp_chain(pred_i);
+		if (pred_i == NULL || !is_Proj(pred_i)) continue;
+
+		pred_i = get_Proj_pred(pred_i);
+		if (!is_Cond(pred_i)) continue;
+
+		/* TODO only handle ifs, not switches for now */
+		if (get_irn_mode(get_Cond_selector(pred_i)) != mode_b) continue;
+
+		for (j = i + 1; j < arity; ++j) {
+			ir_node *pred_j = get_Block_cfgpred(block, j);
+
+			pred_j = follow_Jmp_chain(pred_j);
+			if (pred_j == NULL || !is_Proj(pred_j)) continue;
+
+			pred_j = get_Proj_pred(pred_j);
+
+			/* if both paths end up at the same cond, check if the phis select the
+			 * same on both paths */
+			if (pred_i == pred_j && phis_select_same(get_irn_link(block), i, j)) {
+				ir_node *const jmp = new_r_Jmp(get_nodes_block(pred_i));
+				set_Block_cfgpred(block, i, jmp);
+				set_Block_cfgpred(block, j, new_Bad(mode_X));
+
+				ir_fprintf(stderr, "Found pointless Cond at %+F predecessors %d and %d\n", block, i, j);
+
+				/* Removing a pointless Cond can reveal more of them, so restart
+				 * scanning this block */
+				goto restart;
+			}
+		}
+	}
+}
+
+
+/* Remove all Bad and unreachable predecessors and merge single-entry-single-
+ * exit block chains */
+static void remove_bad_preds(ir_node *const block, void *const env)
+{
+	int const   arity = get_Block_n_cfgpreds(block);
+	int         i;
+	int         j;
+	ir_node   **in;
+	ir_node    *phi;
+	ir_node    *pred;
+
+	(void)env;
+
+	NEW_ARR_A(ir_node*, in, arity);
+
+	/* Remove phi predecessors for Bad predecessor blocks */
+	pred = block;
+	for (phi = get_irn_link(block); phi != NULL; phi = get_irn_link(phi)) {
+		j = 0;
+		for (i = 0; i < arity; ++i) {
+			ir_node *const pred = get_Block_cfgpred(block, i);
+			if (!is_Bad(pred)) in[j++] = get_Phi_pred(phi, i);
+		}
+		assert(j != 0);
+		if (j == 1) {
+			/* Only one phi predecessor left */
+			exchange(phi, in[0]);
+			/* Remove this Phi from the daisy chain */
+			set_irn_link(pred, get_irn_link(phi));
+		} else {
+			if (j != arity) set_irn_in(phi, j, in);
+			pred = phi;
+		}
+	}
+
+	/* Remove all Bad predecessors from block */
+	j = 0;
+	for (i = 0; i < arity; ++i) {
+		ir_node *const pred = get_Block_cfgpred(block, i);
+		if (!is_Bad(pred)) in[j++] = pred;
+	}
+
+	if (j == 1 && is_Jmp(in[0])) {
+		/* Merge block with its only predecessor, which has block as its only
+		 * successor */
+		exchange(block, get_nodes_block(in[0]));
+	} else {
+		if (j != arity) set_irn_in(block, j, in);
+	}
+}
+
+
+/* Remove keep alive edges into unreachable blocks */
+static void remove_keepalives(ir_graph *const irg)
+{
+	ir_node *const end = get_irg_end(irg);
+	int      const n   = get_End_n_keepalives(end);
+	int            i;
+
+	for (i = 0; i != n; ++i) {
+		ir_node *const kept  = get_End_keepalive(end, i);
+		ir_node *const block = is_Block(kept) ? kept : get_nodes_block(kept);
+		if (!bitset_is_set(block_marked, get_irn_idx(block)))
+			set_End_keepalive(end, i, new_Bad(mode_X));
+	}
+}
+
+
+/* Optimise the control flow by
+ * - removing unreachable blocks
+ * - removing Bad control flow predecessors
+ * - removing pointless boolean Conds (ifs which select the same on both paths)
+ * - removing integer Conds with only a default Proj
+ * - TODO removing pointless integer Cond Projs, i.e. cases which select the
+ *   same as the default case
+ * - merging chains of single-entry-single-exit blocks
+ * - TODO merging fans of blocks (blocks which contain nothing but Phis and
+ *   Jmp) into their sucessor
+ * Note: No critical edges are created
+ */
+void optimize_cf(ir_graph *const irg)
+{
+	ir_fprintf(stderr, "cfopt on %+F\n", irg);
+
+	normalize_one_return(irg);
+#if 0 /* HACK CF successor edges of blocks seem to get stale */
+	edges_assure(irg);
+#else
+	edges_deactivate(irg);
+	edges_activate(irg);
+#endif
+
+	block_marked = bitset_malloc(get_irg_last_idx(irg));
+
+	mark_reachable(get_irg_start_block(irg));
+	irg_block_walk_graph(irg, NULL, remove_unreachable_preds, NULL);
+	remove_keepalives(irg);
+
+	bitset_clear_all(block_marked);
+
+	irg_block_walk_graph(irg, NULL, firm_clear_link, NULL);
+	inc_irg_block_visited(irg);
+	irg_walk_graph(irg, NULL, collect_phis_kill_default_and_mark_nonempty, NULL);
+
+#if 0
+	/* TODO just a test */
+	irg_block_walk_graph(irg, NULL, remove_bad_preds, NULL);
+	irg_block_walk_graph(irg, NULL, firm_clear_link, NULL);
+	inc_irg_block_visited(irg);
+	irg_walk_graph(irg, NULL, collect_phis_kill_default_and_mark_nonempty, NULL);
+#endif
+
+	irg_block_walk_graph(irg, NULL, remove_pointless_cond, NULL);
+	bitset_free(block_marked);
+
+	irg_block_walk_graph(irg, NULL, remove_bad_preds, NULL);
+
+	/* TODO only mark as inconsistent if anything was changed */
+	set_irg_outs_inconsistent(irg);
+	set_irg_doms_inconsistent(irg);
+	set_irg_extblk_inconsistent(irg);
+	set_irg_loopinfo_inconsistent(irg);
+}
+
+#else
+
 #include <assert.h>
 #include <stdbool.h>
 
@@ -985,3 +1482,5 @@ ir_graph_pass_t *optimize_cf_pass(const char *name)
 {
 	return def_graph_pass(name ? name : "optimize_cf", optimize_cf);
 }
+
+#endif
