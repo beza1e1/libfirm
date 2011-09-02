@@ -97,7 +97,7 @@ static void remove_unreachable_preds(ir_node *const block, void *const env)
 
 		//ir_fprintf(stderr, "unreachable %+F removed\n", get_nodes_block(pred));
 
-		set_Block_cfgpred(block, i, new_Bad(mode_X));
+		set_Block_cfgpred(block, i, new_r_Bad(get_irn_irg(block), mode_X));
 	}
 }
 
@@ -390,7 +390,7 @@ restart:
 			if (pred_i == pred_j && phis_select_same(get_irn_link(block), i, j)) {
 				ir_node *const jmp = new_r_Jmp(get_nodes_block(pred_i));
 				set_Block_cfgpred(block, i, jmp);
-				set_Block_cfgpred(block, j, new_Bad(mode_X));
+				set_Block_cfgpred(block, j, new_r_Bad(get_irn_irg(block), mode_X));
 
 				ir_fprintf(stderr, "Found pointless Cond at %+F predecessors %d and %d\n", block, i, j);
 
@@ -466,7 +466,7 @@ static void remove_keepalives(ir_graph *const irg)
 		ir_node *const kept  = get_End_keepalive(end, i);
 		ir_node *const block = is_Block(kept) ? kept : get_nodes_block(kept);
 		if (!bitset_is_set(block_marked, get_irn_idx(block)))
-			set_End_keepalive(end, i, new_Bad(mode_X));
+			set_End_keepalive(end, i, new_r_Bad(irg, mode_X));
 	}
 }
 
