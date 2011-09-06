@@ -3003,7 +3003,7 @@ static void apply_cf(ir_node *block, void *ctx)
 				if (!is_Bad(pred_block)) {
 					node_t *pred_bl = get_irn_node(pred_block);
 
-					if (pred_bl->flagged == 0) {
+					if (true) {
 						pred_bl->flagged = 3;
 
 						if (pred_bl->type.tv == tarval_reachable) {
