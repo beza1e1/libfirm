@@ -76,5 +76,6 @@ extern optdesc_t opt_invert_loops;
 extern optdesc_t opt_gcse;
 extern optdesc_t opt_parallel_mem;
 extern optdesc_t opt_jumpthread;
+extern optdesc_t opt_locals;
 
 #endif /* FIRM_OPT_MANAGE_H */
